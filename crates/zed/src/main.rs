@@ -435,7 +435,7 @@ fn main() {
             cx.spawn({
                 let app_state = app_state;
                 async move |cx| {
-                    if let Err(e) = restore_or_create_workspace(app_state, cx).await {
+                    if let Err(e) = restore_or_create_workspace(app_state, None, cx).await {
                         fail_to_open_window_async(e, cx)
                     }
                 }
@@ -846,7 +846,7 @@ fn main() {
                 cx.spawn({
                     let app_state = app_state.clone();
                     async move |cx| {
-                        if let Err(e) = restore_or_create_workspace(app_state, cx).await {
+                        if let Err(e) = restore_or_create_workspace(app_state, None, cx).await {
                             fail_to_open_window_async(e, cx)
                         }
                     }
@@ -1314,14 +1314,16 @@ async fn installation_id() -> Result<IdType> {
 
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
+    env: Option<collections::HashMap<String, String>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
-    // Capture the current environment so terminals inherit it
-    // when Zed is launched from a terminal
-    #[cfg(not(target_os = "windows"))]
-    let env = Some(std::env::vars().collect::<collections::HashMap<_, _>>());
-    #[cfg(target_os = "windows")]
-    let env = None; // Windows inherits environment automatically
+    // Use provided env (from IPC) or capture from current process
+    let env = env.or_else(|| {
+        #[cfg(not(target_os = "windows"))]
+        { Some(std::env::vars().collect::<collections::HashMap<_, _>>()) }
+        #[cfg(target_os = "windows")]
+        { None }
+    });
 
     if let Some((multi_workspaces, remote_workspaces)) = restorable_workspaces(cx, &app_state).await
     {
@@ -1355,6 +1357,7 @@ pub(crate) async fn restore_or_create_workspace(
                     RemoteSettings::get_global(cx).fill_connection_options_from_settings(options)
                 });
             }
+            let env = env.clone();
             let task = cx.spawn(async move |cx| {
                 recent_projects::open_remote_project(
                     connection_options,

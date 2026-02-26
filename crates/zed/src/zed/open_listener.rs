@@ -470,7 +470,30 @@ async fn open_workspaces(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if paths.is_empty() && diff_paths.is_empty() && open_new_workspace != Some(true) {
-        return restore_or_create_workspace(app_state, cx).await;
+        // If workspaces are already open, update their environment with the
+        // one sent by the second instance (so new terminals inherit it) and
+        // bring the window to the foreground.  Only fall through to full
+        // workspace restoration when nothing is open yet.
+        if let Some(env) = env.as_ref() {
+            let windows = cx.update(|cx| workspace::local_workspace_windows(cx));
+            if !windows.is_empty() {
+                for window in &windows {
+                    window.update(cx, |multi_workspace, _window, cx| {
+                        multi_workspace.workspace().update(cx, |workspace, cx| {
+                            workspace.project().update(cx, |project, cx| {
+                                project.set_cli_environment(env.clone(), cx);
+                            });
+                        });
+                    }).ok();
+                }
+                // Bring the first window to the foreground
+                windows[0].update(cx, |_mw, window, _cx| {
+                    window.activate_window();
+                }).ok();
+                return Ok(());
+            }
+        }
+        return restore_or_create_workspace(app_state, env, cx).await;
     }
 
     let grouped_locations: Vec<(SerializedWorkspaceLocation, PathList)> =

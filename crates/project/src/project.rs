@@ -2124,6 +2124,13 @@ impl Project {
     }
 
     #[inline]
+    pub fn set_cli_environment(&self, env: HashMap<String, String>, cx: &mut App) {
+        self.environment.update(cx, |project_env, _cx| {
+            project_env.set_cli_environment(env);
+        });
+    }
+
+    #[inline]
     pub fn peek_environment_error<'a>(&'a self, cx: &'a App) -> Option<&'a String> {
         self.environment.read(cx).peek_environment_error()
     }

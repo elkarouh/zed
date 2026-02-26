@@ -1796,6 +1796,26 @@ impl SearchableItem for TerminalView {
 /// Gets the working directory for the given workspace, respecting the user's settings.
 /// Falls back to home directory when no project directory is available.
 pub(crate) fn default_working_directory(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    // If the launching terminal had a PWD, use it so new terminals start
+    // in the directory the user launched Zed from.
+    let cli_pwd = workspace
+        .project()
+        .read(cx)
+        .cli_environment(cx)
+        .and_then(|env| {
+            env.get("PWD").and_then(|pwd| {
+                let p = PathBuf::from(pwd);
+                if p.is_absolute() && p.is_dir() {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+        });
+    if cli_pwd.is_some() {
+        return cli_pwd;
+    }
+
     let directory = match &TerminalSettings::get_global(cx).working_directory {
         WorkingDirectory::CurrentFileDirectory => workspace
             .project()
