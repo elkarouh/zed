@@ -8058,6 +8058,7 @@ pub struct MultiWorkspaceRestoreResult {
 pub async fn restore_multiworkspace(
     multi_workspace: SerializedMultiWorkspace,
     app_state: Arc<AppState>,
+    env: Option<collections::HashMap<String, String>>,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<MultiWorkspaceRestoreResult> {
     let SerializedMultiWorkspace { workspaces, state } = multi_workspace;
@@ -8067,7 +8068,7 @@ pub async fn restore_multiworkspace(
         .context("window group must not be empty")?;
 
     let window_handle = if first.paths.is_empty() {
-        cx.update(|cx| open_workspace_by_id(first.workspace_id, app_state.clone(), None, cx))
+        cx.update(|cx| open_workspace_by_id(first.workspace_id, app_state.clone(), None, env.clone(), cx))
             .await?
     } else {
         let (window, _items) = cx
@@ -8076,7 +8077,7 @@ pub async fn restore_multiworkspace(
                     first.paths.paths().to_vec(),
                     app_state.clone(),
                     None,
-                    None,
+                    env.clone(),
                     None,
                     cx,
                 )
@@ -8094,6 +8095,7 @@ pub async fn restore_multiworkspace(
                     session_workspace.workspace_id,
                     app_state.clone(),
                     Some(window_handle),
+                    env.clone(),
                     cx,
                 )
             })
@@ -8105,7 +8107,7 @@ pub async fn restore_multiworkspace(
                     session_workspace.paths.paths().to_vec(),
                     app_state.clone(),
                     Some(window_handle),
-                    None,
+                    env.clone(),
                     None,
                     cx,
                 )
@@ -8628,6 +8630,7 @@ pub fn open_workspace_by_id(
     workspace_id: WorkspaceId,
     app_state: Arc<AppState>,
     requesting_window: Option<WindowHandle<MultiWorkspace>>,
+    env: Option<collections::HashMap<String, String>>,
     cx: &mut App,
 ) -> Task<anyhow::Result<WindowHandle<MultiWorkspace>>> {
     let project_handle = Project::local(
@@ -8636,7 +8639,7 @@ pub fn open_workspace_by_id(
         app_state.user_store.clone(),
         app_state.languages.clone(),
         app_state.fs.clone(),
-        None,
+        env,
         project::LocalProjectFlags {
             init_worktree_trust: true,
             ..project::LocalProjectFlags::default()

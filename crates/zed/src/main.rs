@@ -1316,13 +1316,20 @@ pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    // Capture the current environment so terminals inherit it
+    // when Zed is launched from a terminal
+    #[cfg(not(target_os = "windows"))]
+    let env = Some(std::env::vars().collect::<collections::HashMap<_, _>>());
+    #[cfg(target_os = "windows")]
+    let env = None; // Windows inherits environment automatically
+
     if let Some((multi_workspaces, remote_workspaces)) = restorable_workspaces(cx, &app_state).await
     {
         let mut results: Vec<Result<(), Error>> = Vec::new();
         let mut tasks = Vec::new();
 
         for multi_workspace in multi_workspaces {
-            match restore_multiworkspace(multi_workspace, app_state.clone(), cx).await {
+            match restore_multiworkspace(multi_workspace, app_state.clone(), env.clone(), cx).await {
                 Ok(result) => {
                     for error in result.errors {
                         log::error!("Failed to restore workspace in group: {error:#}");
@@ -1353,7 +1360,10 @@ pub(crate) async fn restore_or_create_workspace(
                     connection_options,
                     paths.paths().iter().map(PathBuf::from).collect(),
                     app_state,
-                    workspace::OpenOptions::default(),
+                    workspace::OpenOptions {
+                        env: env.clone(),
+                        ..Default::default()
+                    },
                     cx,
                 )
                 .await
@@ -1417,7 +1427,10 @@ pub(crate) async fn restore_or_create_workspace(
     } else {
         cx.update(|cx| {
             workspace::open_new(
-                Default::default(),
+                workspace::OpenOptions {
+                    env: env.clone(),
+                    ..Default::default()
+                },
                 app_state,
                 cx,
                 |workspace, window, cx| {
