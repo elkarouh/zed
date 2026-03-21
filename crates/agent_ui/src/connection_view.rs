@@ -573,6 +573,7 @@ impl ConnectionView {
                     .and_then(|cwd| util::paths::normalize_lexically(cwd).ok())
                     .map(|path| path.into())
             })
+            .or_else(|| std::env::current_dir().ok().map(|path| path.into()))
             .or_else(|| worktree_roots.first().cloned())
             .unwrap_or_else(|| paths::home_dir().as_path().into());
 
