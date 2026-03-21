@@ -1642,20 +1642,14 @@ impl SerializableItem for TerminalView {
         window.spawn(cx, async move |cx| {
             let (cwd, custom_title) = cx
                 .update(|_window, cx| {
-                    let from_db = TERMINAL_DB
-                        .get_working_directory(item_id, workspace_id)
-                        .log_err()
-                        .flatten();
-                    let cwd = if from_db
-                        .as_ref()
-                        .is_some_and(|from_db| !from_db.as_os_str().is_empty())
-                    {
-                        from_db
-                    } else {
+                    // Use the process launch directory for restored terminals so that
+                    // the active terminal starts in the directory Zed was launched from,
+                    // rather than the saved cwd from the previous session.
+                    let cwd = std::env::current_dir().ok().or_else(|| {
                         workspace
                             .upgrade()
                             .and_then(|workspace| default_working_directory(workspace.read(cx), cx))
-                    };
+                    });
                     let custom_title = TERMINAL_DB
                         .get_custom_title(item_id, workspace_id)
                         .log_err()
