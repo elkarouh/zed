@@ -87,6 +87,8 @@ actions!(
     [
         /// Reruns the last executed task in the terminal.
         RerunTask,
+        /// Opens the entire terminal scrollback buffer in a new editor tab.
+        SendContentsToEditor,
     ]
 );
 
@@ -512,6 +514,8 @@ impl TerminalView {
                 .action("Paste", Box::new(Paste))
                 .action("Select All", Box::new(SelectAll))
                 .action("Clear", Box::new(Clear))
+                .separator()
+                .action("Open Contents in Editor", Box::new(SendContentsToEditor))
                 .when(assistant_enabled, |menu| {
                     menu.separator()
                         .action("Inline Assist", Box::new(InlineAssist::default()))
@@ -838,6 +842,48 @@ impl TerminalView {
         self.terminal.update(cx, |term, _| {
             term.input(text.0.to_string().into_bytes());
         });
+    }
+
+    fn send_contents_to_editor(
+        &mut self,
+        _: &SendContentsToEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let content = self.terminal.read(cx).get_content();
+        if content.trim().is_empty() {
+            return;
+        }
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+
+        let create_buffer =
+            project.update(cx, |project, cx| project.create_buffer(None, true, cx));
+
+        cx.spawn_in(window, async move |_this, cx| {
+            let buffer = create_buffer.await?;
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, content)], None, cx);
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(
+                    Box::new(cx.new(|cx| {
+                        Editor::for_buffer(buffer, Some(project.clone()), window, cx)
+                    })),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn send_keystroke(&mut self, text: &SendKeystroke, _: &mut Window, cx: &mut Context<Self>) {
@@ -1225,6 +1271,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::select_all))
             .on_action(cx.listener(TerminalView::rerun_task))
             .on_action(cx.listener(TerminalView::rename_terminal))
+            .on_action(cx.listener(TerminalView::send_contents_to_editor))
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1526,7 +1573,7 @@ impl Item for TerminalView {
         }
     }
 
-    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+    fn to_item_events(event: &Self::Event, mut f: impl FnMut(ItemEvent)) {
         f(*event)
     }
 }

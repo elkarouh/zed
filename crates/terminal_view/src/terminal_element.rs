@@ -1,12 +1,12 @@
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
-    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
-    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
-    size,
+    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, Corners,
+    DispatchPhase, Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle,
+    FontWeight, GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton,
+    MouseMoveEvent, Pixels, Point, RenderImage, StatefulInteractiveElement, StrikethroughStyle,
+    Styled, TextRun, TextStyle, UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window,
+    div, fill, point, px, relative, size,
 };
 use itertools::Itertools;
 use language::CursorShape;
@@ -14,6 +14,7 @@ use settings::Settings;
 use std::time::Instant;
 use terminal::{
     IndexedCell, Terminal, TerminalBounds, TerminalContent,
+    kitty_graphics,
     alacritty_terminal::{
         grid::Dimensions,
         index::Point as AlacPoint,
@@ -32,6 +33,7 @@ use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
+use std::sync::Arc;
 use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
 use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
@@ -53,6 +55,7 @@ pub struct LayoutState {
     block_below_cursor_element: Option<AnyElement>,
     base_text_style: TextStyle,
     content_mode: ContentMode,
+    images: Vec<(Bounds<Pixels>, Arc<RenderImage>)>, // (bounds_in_cell_coords, image)
 }
 
 /// Helper struct for converting data between Alacritty's cursor points, and displayed cursor points.
@@ -389,6 +392,11 @@ impl TerminalElement {
                 }
                 // Skip wide character spacers - they're just placeholders for the second cell of wide characters
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+
+                // Skip Kitty graphics Unicode placeholder cells
+                if cell.c == kitty_graphics::KITTY_PLACEHOLDER_CHAR {
                     continue;
                 }
 
@@ -1206,6 +1214,60 @@ impl Element for TerminalElement {
                     None
                 };
 
+                // Collect Kitty graphics image placements
+                let images = {
+                    let terminal_ref = self.terminal.read(cx);
+                    let mut result: Vec<(Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
+
+                    // 1. Non-unicode placements from the channel (KgpOld mode)
+                    for p in terminal_ref.last_content.images.iter() {
+                        let x = p.col as f32 * dimensions.cell_width;
+                        let y = p.row as f32 * dimensions.line_height;
+                        let w = p.cols as f32 * dimensions.cell_width;
+                        let h = p.rows as f32 * dimensions.line_height;
+                        result.push((
+                            Bounds::new(point(x, y), size(w, h)),
+                            p.render_image.clone(),
+                        ));
+                    }
+
+                    // 2. Unicode placeholder mode: scan cells for U+10EEEE
+                    let storage = terminal_ref.image_storage.lock().unwrap();
+                    if storage.has_images() {
+                        let mut bounds_map: std::collections::HashMap<u32, (i32, i32, i32, i32)> = std::collections::HashMap::new();
+                        for cell in &terminal_ref.last_content.cells {
+                            if cell.cell.c == kitty_graphics::KITTY_PLACEHOLDER_CHAR {
+                                let (r, g, b) = match cell.cell.fg {
+                                    terminal::alacritty_terminal::vte::ansi::Color::Spec(rgb) => (rgb.r, rgb.g, rgb.b),
+                                    _ => continue,
+                                };
+                                let image_id = kitty_graphics::image_id_from_fg(r, g, b);
+                                let line = cell.point.line.0 + display_offset as i32;
+                                let col = cell.point.column.0 as i32;
+                                let entry = bounds_map.entry(image_id).or_insert((line, col, line, col));
+                                entry.0 = entry.0.min(line);
+                                entry.1 = entry.1.min(col);
+                                entry.2 = entry.2.max(line);
+                                entry.3 = entry.3.max(col);
+                            }
+                        }
+                        for (image_id, (min_line, min_col, max_line, max_col)) in &bounds_map {
+                            if let Some(stored) = storage.get_image(*image_id) {
+                                let x = *min_col as f32 * dimensions.cell_width;
+                                let y = *min_line as f32 * dimensions.line_height;
+                                let w = (*max_col - *min_col + 1) as f32 * dimensions.cell_width;
+                                let h = (*max_line - *min_line + 1) as f32 * dimensions.line_height;
+                                result.push((
+                                    Bounds::new(point(x, y), size(w, h)),
+                                    stored.render_image.clone(),
+                                ));
+                            }
+                        }
+                    }
+
+                    result
+                };
+
                 LayoutState {
                     hitbox,
                     batched_text_runs,
@@ -1222,6 +1284,7 @@ impl Element for TerminalElement {
                     block_below_cursor_element,
                     base_text_style: text_style,
                     content_mode,
+                    images,
                 }
             },
         )
@@ -1300,6 +1363,26 @@ impl Element for TerminalElement {
 
                     for rect in &layout.rects {
                         rect.paint(origin, &layout.dimensions, window);
+                    }
+
+                    // Paint Kitty graphics images
+
+                    for (img_bounds, render_image) in &layout.images {
+
+                        let translated = Bounds::new(
+                            point(
+                                img_bounds.origin.x + origin.x,
+                                img_bounds.origin.y + origin.y,
+                            ),
+                            img_bounds.size,
+                        );
+                        window.paint_image(
+                            translated,
+                            Corners::default(),
+                            render_image.clone(),
+                            0,
+                            false,
+                        ).log_err();
                     }
 
                     for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {

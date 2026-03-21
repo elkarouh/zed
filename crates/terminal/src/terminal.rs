@@ -1,4 +1,5 @@
 pub mod mappings;
+pub mod kitty_graphics;
 
 pub use alacritty_terminal;
 
@@ -73,6 +74,9 @@ use gpui::{
 };
 
 use crate::mappings::{colors::to_alac_rgb, keys::to_esc_str};
+use crate::kitty_graphics::{ImageStorage, ImagePlacement};
+use std::sync::mpsc as std_mpsc;
+use std::sync::Mutex as StdMutex;
 
 actions!(
     terminal,
@@ -126,6 +130,19 @@ pub fn insert_zed_terminal_env(
     env.insert("TERM".to_string(), "xterm-256color".to_string());
     env.insert("COLORTERM".to_string(), "truecolor".to_string());
     env.insert("TERM_PROGRAM_VERSION".to_string(), version.to_string());
+
+    // Remove inherited terminal emulator env vars that don't apply in Zed.
+    for var in &[
+        "KITTY_PID", "KITTY_INSTALLATION_DIR",
+        "WEZTERM", "WEZTERM_PANE", "WEZTERM_UNIX_SOCKET",
+        "WEZTERM_EXECUTABLE", "WEZTERM_EXECUTABLE_DIR",
+        "WEZTERM_CONFIG_DIR", "WEZTERM_CONFIG_FILE",
+    ] {
+        env.remove(*var);
+    }
+
+    // Advertise Kitty Graphics Protocol support so TUI apps (yazi, etc.) use KGP
+    env.insert("KITTY_WINDOW_ID".to_string(), "1".to_string());
 }
 
 ///Upward flowing events, for changing the title and such
@@ -182,11 +199,78 @@ enum InternalEvent {
 
 ///A translation struct for Alacritty to communicate with us from their event loop
 #[derive(Clone)]
-pub struct ZedListener(pub UnboundedSender<AlacTermEvent>);
+pub struct ZedListener {
+    pub events_tx: UnboundedSender<AlacTermEvent>,
+    pub image_storage: Arc<std::sync::Mutex<ImageStorage>>,
+    pub pending_apc: Arc<StdMutex<Vec<u8>>>,
+    pub image_tx: std_mpsc::Sender<ImagePlacement>,
+    pub last_cup: Arc<StdMutex<Option<(u16, u16)>>>,
+}
 
 impl EventListener for ZedListener {
     fn send_event(&self, event: AlacTermEvent) {
-        self.0.unbounded_send(event).ok();
+        self.events_tx.unbounded_send(event).ok();
+    }
+
+    fn filter_bytes(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut pending = self.pending_apc.lock().unwrap();
+        let had_pending = !pending.is_empty();
+
+        // Quick check: if no pending data and no ESC in new bytes, skip entirely
+        if !had_pending && !bytes.contains(&0x1b) {
+            return None;
+        }
+
+        let (filtered, apcs) = kitty_graphics::extract_kitty_apc_buffered(bytes, &mut pending);
+
+        // Always scan for CUP sequences to track cursor position.
+        // Yazi sends CUP well before the APC image data.
+        if let Some(pos) = kitty_graphics::extract_last_cup(bytes) {
+            *self.last_cup.lock().unwrap() = Some(pos);
+        }
+
+        if apcs.is_empty() && !had_pending {
+            return None;
+        }
+
+        let mut storage = self.image_storage.lock().unwrap();
+        for payload in apcs {
+            if let Some(response) = storage.process_command(&payload) {
+                let resp_str = String::from_utf8_lossy(&response).into_owned();
+                self.events_tx.unbounded_send(AlacTermEvent::PtyWrite(resp_str)).ok();
+            }
+        }
+        // Send clear signals for delete-all commands
+        // (only if no new image was transmitted in the same batch)
+        if storage.placements.is_empty() && storage.had_delete {
+            use gpui::RenderImage;
+            use image::{DynamicImage, Frame, RgbaImage};
+            let dummy = RgbaImage::from_pixel(1, 1, image::Rgba([0,0,0,0]));
+            let frame = Frame::new(DynamicImage::ImageRgba8(dummy).into_rgba8().into());
+            let render_image = Arc::new(RenderImage::new(vec![frame]));
+            self.image_tx.send(ImagePlacement {
+                image_id: 0, render_image, width: 0, height: 0,
+                use_unicode_placeholders: false, z_index: 0,
+                needs_cursor_position: false, col: 0, row: 0, cols: 0, rows: 0,
+                is_clear: true,
+            }).ok();
+        }
+        storage.had_delete = false;
+
+        // Send any new placements through the dedicated channel,
+        // with cursor position resolved from the byte stream
+        for mut placement in storage.placements.drain(..) {
+            if placement.needs_cursor_position {
+                if let Some((row, col)) = *self.last_cup.lock().unwrap() {
+                    placement.row = row;
+                    placement.col = col;
+                    placement.needs_cursor_position = false;
+                }
+            }
+
+            self.image_tx.send(placement).ok();
+        }
+        Some(filtered)
     }
 }
 
@@ -363,10 +447,18 @@ impl TerminalBuilder {
         };
 
         let (events_tx, events_rx) = unbounded();
+        let image_storage = Arc::new(StdMutex::new(ImageStorage::new()));
+        let (image_tx, image_rx) = std_mpsc::channel();
         let mut term = Term::new(
             config.clone(),
             &TerminalBounds::default(),
-            ZedListener(events_tx),
+            ZedListener {
+                events_tx,
+                image_storage: image_storage.clone(),
+                pending_apc: Arc::new(StdMutex::new(Vec::new())),
+                image_tx: image_tx.clone(),
+                last_cup: Arc::new(StdMutex::new(None)),
+            },
         );
 
         if let AlternateScroll::Off = alternate_scroll {
@@ -395,6 +487,8 @@ impl TerminalBuilder {
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
             is_remote_terminal: false,
+            image_storage: image_storage.clone(),
+            image_rx: StdMutex::new(image_rx),
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
@@ -570,11 +664,19 @@ impl TerminalBuilder {
             //Spawn a task so the Alacritty EventLoop can communicate with us
             //TODO: Remove with a bounded sender which can be dispatched on &self
             let (events_tx, events_rx) = unbounded();
+            let image_storage = Arc::new(StdMutex::new(ImageStorage::new()));
+            let (image_tx, image_rx) = std_mpsc::channel();
             //Set up the terminal...
             let mut term = Term::new(
                 config.clone(),
                 &TerminalBounds::default(),
-                ZedListener(events_tx.clone()),
+                ZedListener {
+                    events_tx: events_tx.clone(),
+                    image_storage: image_storage.clone(),
+                    pending_apc: Arc::new(StdMutex::new(Vec::new())),
+                    image_tx: image_tx.clone(),
+                    last_cup: Arc::new(StdMutex::new(None)),
+                },
             );
 
             //Alacritty defaults to alternate scrolling being on, so we just need to turn it off.
@@ -589,7 +691,13 @@ impl TerminalBuilder {
             //And connect them together
             let event_loop = EventLoop::new(
                 term.clone(),
-                ZedListener(events_tx),
+                ZedListener {
+                    events_tx,
+                    image_storage: image_storage.clone(),
+                    pending_apc: Arc::new(StdMutex::new(Vec::new())),
+                    image_tx: image_tx.clone(),
+                    last_cup: Arc::new(StdMutex::new(None)),
+                },
                 pty,
                 pty_options.drain_on_exit,
                 false,
@@ -626,6 +734,8 @@ impl TerminalBuilder {
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal,
+                image_storage: image_storage.clone(),
+                image_rx: StdMutex::new(image_rx),
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
@@ -784,6 +894,7 @@ impl Deref for IndexedCell {
 #[derive(Clone)]
 pub struct TerminalContent {
     pub cells: Vec<IndexedCell>,
+    pub images: Vec<ImagePlacement>,
     pub mode: TermMode,
     pub display_offset: usize,
     pub selection_text: Option<String>,
@@ -807,6 +918,7 @@ impl Default for TerminalContent {
     fn default() -> Self {
         TerminalContent {
             cells: Default::default(),
+            images: Vec::new(),
             mode: Default::default(),
             display_offset: Default::default(),
             selection_text: Default::default(),
@@ -859,6 +971,8 @@ pub struct Terminal {
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
+    pub image_storage: Arc<StdMutex<ImageStorage>>,
+    pub image_rx: StdMutex<std_mpsc::Receiver<ImagePlacement>>,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<Point<Pixels>>,
     mouse_down_hyperlink: Option<(String, bool, Match)>,
@@ -1602,10 +1716,10 @@ impl Terminal {
             self.process_terminal_event(&e, &mut terminal, window, cx)
         }
 
-        self.last_content = Self::make_content(&terminal, &self.last_content);
+        self.last_content = Self::make_content(&terminal, &self.last_content, &self.image_rx);
     }
 
-    fn make_content(term: &Term<ZedListener>, last_content: &TerminalContent) -> TerminalContent {
+    fn make_content(term: &Term<ZedListener>, last_content: &TerminalContent, image_rx: &StdMutex<std_mpsc::Receiver<ImagePlacement>>) -> TerminalContent {
         let content = term.renderable_content();
 
         // Pre-allocate with estimated size to reduce reallocations
@@ -1635,6 +1749,47 @@ impl Terminal {
             last_hovered_word: last_content.last_hovered_word.clone(),
             scrolled_to_top: content.display_offset == term.history_size(),
             scrolled_to_bottom: content.display_offset == 0,
+            images: {
+                let cell_width = last_content.terminal_bounds.cell_width;
+                let line_height = last_content.terminal_bounds.line_height;
+
+                // Receive new placements from the filter_bytes channel
+                let rx = image_rx.lock().unwrap();
+                let mut new_placements = Vec::new();
+                while let Ok(p) = rx.try_recv() {
+                    new_placements.push(p);
+                }
+                drop(rx);
+
+                if !new_placements.is_empty() {
+                    // Check if this batch contains a clear signal
+                    let has_clear = new_placements.iter().any(|p| p.is_clear);
+                    let has_image = new_placements.iter().any(|p| !p.is_clear);
+                    if has_clear && !has_image {
+                        // Clear all images
+                        Vec::new()
+                    } else {
+                    let mut resolved = Vec::new();
+                    for p in new_placements.into_iter().filter(|p| !p.is_clear) {
+                        let mut placement = p;
+                        // Compute cell dimensions if not yet set
+                        if placement.cols == 0 || placement.rows == 0 {
+                            if cell_width > gpui::px(0.) && line_height > gpui::px(0.) {
+                                let cw: f32 = cell_width.into();
+                                let lh: f32 = line_height.into();
+                                placement.cols = ((placement.width as f32) / cw).ceil() as u16;
+                                placement.rows = ((placement.height as f32) / lh).ceil() as u16;
+                            }
+                        }
+                        resolved.push(placement);
+                    }
+                    resolved
+                    }
+                } else {
+                    // Keep previous images
+                    last_content.images.clone()
+                }
+            },
         }
     }
 
