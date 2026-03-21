@@ -571,11 +571,6 @@ impl ConnectionView {
                     .cwd
                     .as_ref()
                     .and_then(|cwd| util::paths::normalize_lexically(cwd).ok())
-                    .filter(|cwd| {
-                        worktree_roots
-                            .iter()
-                            .any(|root| cwd.starts_with(root.as_ref()))
-                    })
                     .map(|path| path.into())
             })
             .or_else(|| worktree_roots.first().cloned())
