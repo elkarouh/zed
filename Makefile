@@ -1,5 +1,6 @@
 # Requires gcc-toolset-13 (RHEL 8) and a sibling alacritty repo:
 #   ../alacritty/alacritty_terminal  (patched via .cargo/config.toml)
+#   Fork: https://github.com/elkarouh/alacritty  branch: local-patches
 # See BUILD-RHEL8.md for full setup instructions.
 
 ENV = source /opt/rh/gcc-toolset-13/enable && \
