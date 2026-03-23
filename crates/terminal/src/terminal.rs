@@ -2772,7 +2772,7 @@ mod tests {
 
         terminal.update(cx, |terminal, _cx| {
             let term_lock = terminal.term.lock();
-            terminal.last_content = Terminal::make_content(&term_lock, &terminal.last_content);
+            terminal.last_content = Terminal::make_content(&term_lock, &terminal.last_content, &terminal.image_rx);
             drop(term_lock);
 
             let terminal_bounds = TerminalBounds::new(
@@ -3159,7 +3159,7 @@ mod tests {
         // Get the content by directly accessing the term
         let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            Terminal::make_content(&term, &terminal.last_content)
+            Terminal::make_content(&term, &terminal.last_content, &terminal.image_rx)
         });
 
         // If LF is properly converted to CRLF, each line should start at column 0
@@ -3207,7 +3207,7 @@ mod tests {
         // Get the content by directly accessing the term
         let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            Terminal::make_content(&term, &terminal.last_content)
+            Terminal::make_content(&term, &terminal.last_content, &terminal.image_rx)
         });
 
         let cells = &content.cells;
@@ -3249,7 +3249,7 @@ mod tests {
         // Get the content by directly accessing the term
         let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            Terminal::make_content(&term, &terminal.last_content)
+            Terminal::make_content(&term, &terminal.last_content, &terminal.image_rx)
         });
 
         let cells = &content.cells;

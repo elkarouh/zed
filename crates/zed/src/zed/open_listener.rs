@@ -39,6 +39,8 @@ pub struct OpenRequest {
     pub open_channel_notes: Vec<(u64, Option<String>)>,
     pub join_channel: Option<u64>,
     pub remote_connection: Option<RemoteConnectionOptions>,
+    pub open_new_workspace: Option<bool>,
+    pub reuse: bool,
 }
 
 #[derive(Debug)]
@@ -77,6 +79,8 @@ impl OpenRequest {
 
         this.diff_paths = request.diff_paths;
         this.diff_all = request.diff_all;
+        this.open_new_workspace = request.open_new_workspace;
+        this.reuse = request.reuse;
         if let Some(wsl) = request.wsl {
             let (user, distro_name) = if let Some((user, distro)) = wsl.split_once('@') {
                 if user.is_empty() {
@@ -255,6 +259,8 @@ pub struct RawOpenRequest {
     pub diff_paths: Vec<[String; 2]>,
     pub diff_all: bool,
     pub wsl: Option<String>,
+    pub open_new_workspace: Option<bool>,
+    pub reuse: bool,
 }
 
 impl Global for OpenListener {}
@@ -296,6 +302,110 @@ pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn send_args_to_running_instance(
+    paths_or_urls: &[String],
+    diff: &[String],
+    open_new_workspace: Option<bool>,
+    reuse: bool,
+) {
+    use cli::ipc::IpcOneShotServer;
+    use release_channel::RELEASE_CHANNEL_NAME;
+    use std::os::unix::net::UnixDatagram;
+    use std::path::Path;
+
+    let sock_path = paths::data_dir().join(format!("zed-{}.sock", *RELEASE_CHANNEL_NAME));
+
+    let sock = match UnixDatagram::unbound() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if sock.connect(&sock_path).is_err() {
+        return;
+    }
+
+    let (server, server_name) = match IpcOneShotServer::<IpcHandshake>::new() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let url = format!("zed-cli://{server_name}");
+    if sock.send(url.as_bytes()).is_err() {
+        return;
+    }
+
+    // Collect paths and URLs
+    let mut paths = Vec::new();
+    let mut urls = Vec::new();
+    for arg in paths_or_urls {
+        if arg.starts_with("zed://")
+            || arg.starts_with("http://")
+            || arg.starts_with("https://")
+            || arg.starts_with("file://")
+            || arg.starts_with("ssh://")
+        {
+            urls.push(arg.clone());
+        } else {
+            match std::fs::canonicalize(arg) {
+                Ok(path) => paths.push(path.to_string_lossy().into_owned()),
+                Err(_) => {
+                    // For non-existing paths, resolve as much as possible
+                    let path = Path::new(arg);
+                    if path.is_absolute() {
+                        paths.push(arg.clone());
+                    } else if let Ok(cwd) = std::env::current_dir() {
+                        paths.push(cwd.join(arg).to_string_lossy().into_owned());
+                    } else {
+                        paths.push(arg.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut diff_paths = Vec::new();
+    for pair in diff.chunks(2) {
+        if pair.len() == 2 {
+            diff_paths.push([pair[0].clone(), pair[1].clone()]);
+        }
+    }
+
+    // Wait for the handshake from the running instance, then send the request
+    let _ = std::thread::Builder::new()
+        .name("SendArgsToInstance".to_string())
+        .spawn(move || {
+            let Ok((_, handshake)) = server.accept() else {
+                return;
+            };
+            let _ = handshake.requests.send(CliRequest::Open {
+                paths,
+                urls,
+                diff_paths,
+                diff_all: false,
+                wsl: None,
+                wait: false,
+                open_new_workspace,
+                reuse,
+                env: Some(std::env::vars().collect()),
+                user_data_dir: None,
+            });
+            // Wait for response
+            while let Ok(response) = handshake.responses.recv() {
+                match response {
+                    CliResponse::Ping => {}
+                    CliResponse::Stdout { message } => println!("{message}"),
+                    CliResponse::Stderr { message } => eprintln!("{message}"),
+                    CliResponse::Exit { status } => {
+                        if status != 0 {
+                            std::process::exit(status);
+                        }
+                        return;
+                    }
+                }
+            }
+        })
+        .and_then(|handle| Ok(handle.join()));
 }
 
 fn connect_to_cli(
@@ -416,6 +526,8 @@ pub async fn handle_cli_connection(
                                 diff_paths,
                                 diff_all,
                                 wsl,
+                                open_new_workspace,
+                                reuse,
                             },
                             cx,
                         ) {

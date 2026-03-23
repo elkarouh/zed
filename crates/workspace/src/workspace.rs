@@ -8611,6 +8611,7 @@ pub async fn find_existing_workspace(
                 }
             });
         }
+
     }
     (existing, open_visible)
 }

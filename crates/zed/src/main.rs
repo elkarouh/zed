@@ -350,14 +350,59 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
+    // On Linux/FreeBSD, always set up the CLI socket so that --add and --reuse
+    // can forward to a running instance even when the dev channel is active.
+    // For non-dev builds this also enforces the single-instance check.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    let linux_single_instance_result =
+        if !*zed_env_vars::ZED_STATELESS {
+            Some(crate::zed::listen_for_cli_connections(open_listener.clone()))
+        } else {
+            None
+        };
+
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
     {
+        // For dev builds: allow multiple instances, but still forward --add/--reuse
+        // to a running instance via IPC if one is listening.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        if let Some(Err(_)) = linux_single_instance_result {
+            if args.add || args.reuse {
+                let open_new_workspace = if args.add { Some(false) } else { Some(true) };
+                crate::zed::send_args_to_running_instance(
+                    &args.paths_or_urls,
+                    &args.diff,
+                    open_new_workspace,
+                    args.reuse,
+                );
+                println!("zed is already running");
+                return;
+            }
+        }
         false
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
-            crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
+            if let Some(Err(_)) = linux_single_instance_result {
+                // Another instance is running. Send args via IPC.
+                let open_new_workspace = if args.new {
+                    Some(true)
+                } else if args.add {
+                    Some(false)
+                } else {
+                    Some(true)
+                };
+                crate::zed::send_args_to_running_instance(
+                    &args.paths_or_urls,
+                    &args.diff,
+                    open_new_workspace,
+                    args.reuse,
+                );
+                true
+            } else {
+                false
+            }
         }
 
         #[cfg(target_os = "windows")]
@@ -824,12 +869,22 @@ fn main() {
         #[cfg(not(target_os = "windows"))]
         let wsl = None;
 
+        let open_new_workspace = if args.new {
+            Some(true)
+        } else if args.add {
+            Some(false)
+        } else {
+            Some(true)
+        };
+
         if !urls.is_empty() || !diff_paths.is_empty() {
             open_listener.open(RawOpenRequest {
                 urls,
                 diff_paths,
                 wsl,
                 diff_all: diff_all_mode,
+                open_new_workspace,
+                reuse: args.reuse,
             })
         }
 
@@ -1182,7 +1237,10 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 &request.diff_paths,
                 request.diff_all,
                 app_state,
-                workspace::OpenOptions::default(),
+                workspace::OpenOptions {
+                    open_new_workspace: request.open_new_workspace,
+                    ..Default::default()
+                },
                 cx,
             )
             .await?;
@@ -1572,6 +1630,16 @@ struct Args {
     /// When directories are provided, recurses into them and shows all changed files in a single multi-diff view.
     #[arg(long, action = clap::ArgAction::Append, num_args = 2, value_names = ["OLD_PATH", "NEW_PATH"])]
     diff: Vec<String>,
+
+    /// Add files to the currently open workspace
+    #[arg(short, long, overrides_with_all = ["new", "reuse"])]
+    add: bool,
+    /// Create a new workspace
+    #[arg(short, long, overrides_with_all = ["add", "reuse"])]
+    new: bool,
+    /// Reuse an existing window, replacing its workspace
+    #[arg(short, long, overrides_with_all = ["add", "new"])]
+    reuse: bool,
 
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     ///
