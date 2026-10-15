@@ -239,6 +239,15 @@ enum RendererState {
     /// the device, pipelines, and atlas remain so `replace_surface` can resume without
     /// re-uploading cached textures.
     Unconfigured { core: WgpuRendererCore },
+    /// X11 offscreen-blit fallback (see `WgpuRenderer::new_offscreen_x11`): renders into
+    /// a plain off-screen texture instead of a presentable surface. The caller reads the
+    /// rendered pixels back via `take_offscreen_frame` and pushes them to the real window
+    /// itself (e.g. via XPutImage), since no native surface/presentation is ever created.
+    OffscreenX11 {
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        core: WgpuRendererCore,
+    },
     /// Released by `destroy`, or dropped for a device recovery that has not succeeded yet.
     Released,
 }
@@ -262,21 +271,42 @@ pub struct WgpuRenderer {
     observed_error_generation: u64,
     last_surface_error: Option<String>,
     needs_redraw: bool,
+    /// Set by `draw` when `state` is `OffscreenX11`; taken by the caller via
+    /// `take_offscreen_frame` to push to the real window.
+    last_offscreen_frame: Option<(Vec<u8>, u32, u32)>,
 }
 
 impl WgpuRenderer {
     fn core(&self) -> Option<&WgpuRendererCore> {
         match &self.state {
-            RendererState::Ready { core, .. } | RendererState::Unconfigured { core } => Some(core),
+            RendererState::Ready { core, .. }
+            | RendererState::Unconfigured { core }
+            | RendererState::OffscreenX11 { core, .. } => Some(core),
             RendererState::Released => None,
         }
     }
 
     fn core_mut(&mut self) -> Option<&mut WgpuRendererCore> {
         match &mut self.state {
-            RendererState::Ready { core, .. } | RendererState::Unconfigured { core } => Some(core),
+            RendererState::Ready { core, .. }
+            | RendererState::Unconfigured { core }
+            | RendererState::OffscreenX11 { core, .. } => Some(core),
             RendererState::Released => None,
         }
+    }
+
+    /// True if this renderer is using the X11 offscreen-blit fallback (see
+    /// `new_offscreen_x11`) instead of a native presentable surface.
+    pub fn is_offscreen_x11(&self) -> bool {
+        matches!(self.state, RendererState::OffscreenX11 { .. })
+    }
+
+    /// Takes the most recently rendered offscreen frame (packed BGRA8 bytes,
+    /// width, height), if any. Only ever populated when `is_offscreen_x11()`
+    /// is true; the caller is responsible for pushing these pixels to the
+    /// real window (e.g. via XPutImage).
+    pub fn take_offscreen_frame(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        self.last_offscreen_frame.take()
     }
 
     /// Creates a new WgpuRenderer from raw window handles.
@@ -485,7 +515,278 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            last_offscreen_frame: None,
         })
+    }
+
+    /// Creates a `WgpuRenderer` that renders into an off-screen texture
+    /// instead of a presentable surface, for the X11 offscreen-blit
+    /// fallback (see the `OffscreenX11` doc comment on `RendererState`).
+    ///
+    /// Unlike `new`, this never calls `create_surface_unsafe` or probes a
+    /// real window surface, so it can't trigger the NVIDIA Vulkan driver
+    /// crash observed on this host's VNC X server during surface creation.
+    /// The caller is responsible for actually displaying the pixels
+    /// produced by `draw`/`take_offscreen_frame` (e.g. via XPutImage).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_offscreen_x11(
+        gpu_context: GpuContext,
+        config: WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
+    ) -> anyhow::Result<Self> {
+        let mut ctx_ref = gpu_context.borrow_mut();
+        let context = match ctx_ref.as_mut() {
+            Some(context) => context,
+            None => {
+                let (context, _target_format) = WgpuContext::new_for_offscreen(compositor_gpu)?;
+                ctx_ref.insert(context)
+            }
+        };
+
+        let atlas = Arc::new(WgpuAtlas::from_context(context));
+        let device = Arc::clone(&context.device);
+        let max_texture_size = device.limits().max_texture_dimension_2d;
+
+        let requested_width = config.size.width.0 as u32;
+        let requested_height = config.size.height.0 as u32;
+        let width = requested_width.clamp(1, max_texture_size);
+        let height = requested_height.clamp(1, max_texture_size);
+
+        // Matches `offscreen_target_format`'s preferred choice: this is the byte
+        // order the X11 blitter expects, so no channel swizzle is needed.
+        let target_format = wgpu::TextureFormat::Bgra8Unorm;
+        let alpha_mode = if config.transparent {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else {
+            wgpu::CompositeAlphaMode::Opaque
+        };
+
+        let core = WgpuRendererCore::new(context, atlas.clone(), target_format, alpha_mode);
+        let (texture, view) = Self::create_offscreen_texture(&device, target_format, width, height);
+
+        // Kept as the single source of truth for the current width/height even in
+        // offscreen mode. Nothing reads its `present_mode`/`format` when `state`
+        // is `OffscreenX11`; `configure`/surface-specific fields are otherwise unused.
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: target_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode,
+            view_formats: vec![],
+        };
+
+        let device_errors = Arc::clone(context.errors());
+        drop(ctx_ref);
+
+        Ok(Self {
+            context: Some(Rc::clone(&gpu_context)),
+            compositor_gpu,
+            state: RendererState::OffscreenX11 { texture, view, core },
+            surface_config,
+            atlas,
+            transparent_alpha_mode: alpha_mode,
+            opaque_alpha_mode: alpha_mode,
+            max_texture_size,
+            is_bgr: false,
+            failed_frame_count: 0,
+            device_errors,
+            observed_error_generation: 0,
+            last_surface_error: None,
+            needs_redraw: false,
+            last_offscreen_frame: None,
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn create_offscreen_texture(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("offscreen_x11_render_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    /// Reads a texture back to CPU memory as tightly packed BGRA8 bytes
+    /// (`width * height * 4`), unpadding wgpu's row alignment requirement.
+    #[cfg(not(target_family = "wasm"))]
+    fn read_offscreen_pixels_bgra(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let bytes_per_row = width
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("offscreen X11 row size overflowed"))?;
+        let padded_bytes_per_row = bytes_per_row
+            .checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            .ok_or_else(|| anyhow::anyhow!("offscreen X11 padded row size overflowed"))?;
+        let buffer_size = u64::from(padded_bytes_per_row)
+            .checked_mul(u64::from(height))
+            .ok_or_else(|| anyhow::anyhow!("offscreen X11 readback buffer size overflowed"))?;
+        anyhow::ensure!(
+            buffer_size <= device.limits().max_buffer_size,
+            "offscreen X11 readback buffer size {buffer_size} exceeds maximum buffer size {}",
+            device.limits().max_buffer_size
+        );
+
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("offscreen_x11_readback_buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("offscreen_x11_readback_encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = queue.submit(std::iter::once(encoder.finish()));
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if sender.send(result).is_err() {
+                    log::error!(
+                        "Offscreen X11 readback receiver was dropped before mapping completed"
+                    );
+                }
+            });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(5)),
+            })
+            .map_err(|error| anyhow::anyhow!("Failed to wait for offscreen X11 rendering: {error}"))?;
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to receive offscreen X11 mapping result: {error}")
+            })?
+            .map_err(|error| anyhow::anyhow!("Failed to map offscreen X11 readback buffer: {error}"))?;
+
+        let mapped_data = readback_buffer.slice(..).get_mapped_range()?;
+        let pixel_capacity = usize::try_from(u64::from(bytes_per_row) * u64::from(height))
+            .map_err(|_| anyhow::anyhow!("offscreen X11 image size exceeds addressable memory"))?;
+        let mut pixels = Vec::with_capacity(pixel_capacity);
+        for row in mapped_data
+            .chunks_exact(padded_bytes_per_row as usize)
+            .take(height as usize)
+        {
+            pixels.extend_from_slice(&row[..bytes_per_row as usize]);
+        }
+        drop(mapped_data);
+        readback_buffer.unmap();
+
+        Ok(pixels)
+    }
+
+    /// Renders into the offscreen texture and reads the result back, storing
+    /// it for `take_offscreen_frame`. Mirrors the `Ready` branch of `draw`
+    /// but targets a plain texture instead of an acquired surface frame.
+    #[cfg(not(target_family = "wasm"))]
+    fn draw_offscreen_x11(&mut self, scene: &Scene) -> bool {
+        if let Some(error) = self.last_surface_error.take().or_else(|| {
+            self.device_errors
+                .observe_error(&mut self.observed_error_generation)
+        }) {
+            self.failed_frame_count += 1;
+            log::error!(
+                "GPU error during offscreen X11 frame (failure {} of 10): {error}",
+                self.failed_frame_count
+            );
+            if self.failed_frame_count > 10 {
+                panic!("Too many consecutive GPU errors. Last error: {error}");
+            } else if self.failed_frame_count > 5 {
+                if let RendererState::OffscreenX11 { core, .. } = &mut self.state {
+                    core.resources.invalidate_intermediate_textures();
+                }
+                self.atlas.clear();
+                self.needs_redraw = true;
+                self.failed_frame_count = 0;
+                return false;
+            }
+        } else {
+            self.failed_frame_count = 0;
+        }
+
+        let RendererState::OffscreenX11 { texture, view, core } = &mut self.state else {
+            return false;
+        };
+
+        let width = texture.width();
+        let height = texture.height();
+        let size = Size {
+            width: DevicePixels(width as i32),
+            height: DevicePixels(height as i32),
+        };
+        let premultiplied_alpha =
+            self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+
+        if let Err(error) =
+            core.render_frame(scene, view, size, premultiplied_alpha, wgpu::Color::TRANSPARENT)
+        {
+            log::error!("{error:#}");
+            return false;
+        }
+
+        match Self::read_offscreen_pixels_bgra(
+            &core.resources.device,
+            &core.resources.queue,
+            texture,
+            width,
+            height,
+        ) {
+            Ok(pixels) => {
+                self.last_offscreen_frame = Some((pixels, width, height));
+                true
+            }
+            Err(error) => {
+                log::error!("Failed to read back offscreen X11 frame: {error:#}");
+                false
+            }
+        }
     }
 }
 
@@ -1042,6 +1343,18 @@ impl WgpuRenderer {
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
         }
+
+        #[cfg(not(target_family = "wasm"))]
+        if let RendererState::OffscreenX11 { texture, view, core } = &mut self.state {
+            let (new_texture, new_view) = Self::create_offscreen_texture(
+                &core.resources.device,
+                self.surface_config.format,
+                self.surface_config.width,
+                self.surface_config.height,
+            );
+            *texture = new_texture;
+            *view = new_view;
+        }
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1124,6 +1437,11 @@ impl WgpuRenderer {
                 self.unconfigure_surface();
             }
             return false;
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        if matches!(self.state, RendererState::OffscreenX11 { .. }) {
+            return self.draw_offscreen_x11(scene);
         }
 
         // Bail out early if the surface has been unconfigured (e.g. during
@@ -2112,7 +2430,9 @@ impl WgpuRenderer {
                 drop(surface);
                 RendererState::Unconfigured { core }
             }
-            state @ (RendererState::Unconfigured { .. } | RendererState::Released) => state,
+            state @ (RendererState::Unconfigured { .. }
+            | RendererState::OffscreenX11 { .. }
+            | RendererState::Released) => state,
         };
         // Drop intermediate textures since they reference the old surface size.
         if let Some(core) = self.core_mut() {
@@ -2169,6 +2489,12 @@ impl WgpuRenderer {
             RendererState::Released => {
                 anyhow::bail!("Cannot replace the surface: GPU resources have been released")
             }
+            RendererState::OffscreenX11 { .. } => {
+                anyhow::bail!(
+                    "Cannot replace the surface: renderer is using the X11 offscreen-blit \
+                     fallback, which never has a native surface"
+                )
+            }
         };
         surface.configure(&core.resources.device, &self.surface_config);
         core.resources.invalidate_intermediate_textures();
@@ -2206,6 +2532,12 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        if self.is_offscreen_x11() {
+            // Never fall through to the surface-creating path below: that's
+            // exactly the crash the offscreen-blit fallback exists to avoid.
+            return self.recover_offscreen_x11();
+        }
+
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
         // Check if another window already recovered the context
@@ -2270,6 +2602,45 @@ impl WgpuRenderer {
         self.set_subpixel_layout(is_bgr);
 
         log::info!("GPU recovery complete");
+        Ok(())
+    }
+
+    /// `recover` for the `OffscreenX11` state: rebuilds the device and the
+    /// offscreen texture, but never creates a native surface.
+    #[cfg(not(target_family = "wasm"))]
+    fn recover_offscreen_x11(&mut self) -> anyhow::Result<()> {
+        let gpu_context = self
+            .context
+            .as_ref()
+            .expect("recover requires gpu_context")
+            .clone();
+
+        log::warn!("GPU device lost (offscreen X11 renderer), recreating context...");
+        self.state = RendererState::Released;
+        *gpu_context.borrow_mut() = None;
+        std::thread::sleep(std::time::Duration::from_millis(350));
+
+        let (new_context, _target_format) = WgpuContext::new_for_offscreen(self.compositor_gpu)?;
+        *gpu_context.borrow_mut() = Some(new_context);
+
+        let ctx_ref = gpu_context.borrow();
+        let context = ctx_ref.as_ref().expect("context should exist");
+        self.atlas.handle_device_lost(context);
+
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let target_format = self.surface_config.format;
+        let alpha_mode = self.surface_config.alpha_mode;
+        let device = Arc::clone(&context.device);
+
+        let core = WgpuRendererCore::new(context, self.atlas.clone(), target_format, alpha_mode);
+        let (texture, view) = Self::create_offscreen_texture(&device, target_format, width, height);
+
+        self.device_errors = Arc::clone(context.errors());
+        self.observed_error_generation = 0;
+        self.state = RendererState::OffscreenX11 { texture, view, core };
+
+        log::info!("GPU recovery complete (offscreen X11)");
         Ok(())
     }
 }

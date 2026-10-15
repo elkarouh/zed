@@ -1879,7 +1879,7 @@ impl Window {
                                 callback(window, cx);
                             }
                         })
-                        .log_err();
+                        .warn_on_err();
                 }
 
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
@@ -1907,12 +1907,12 @@ impl Window {
                                 window.present();
                                 arena_clear_needed.clear(cx);
                             })
-                            .log_err();
+                            .warn_on_err();
                     })
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
-                        .log_err();
+                        .warn_on_err();
                 }
 
                 handle
@@ -1923,7 +1923,7 @@ impl Window {
                             window.platform_window.schedule_frame();
                         }
                     })
-                    .log_err();
+                    .warn_on_err();
 
                 // Platforms that stop requesting frames for idle windows only
                 // deliver another request after a wakeup. If demand remains
@@ -1965,7 +1965,7 @@ impl Window {
             move |_, _| {
                 handle
                     .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
-                    .log_err();
+                    .warn_on_err();
             }
         }));
         platform_window.on_moved(Box::new({
@@ -1973,7 +1973,7 @@ impl Window {
             move || {
                 handle
                     .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
-                    .log_err();
+                    .warn_on_err();
             }
         }));
         platform_window.on_display_changed(Box::new({
@@ -1991,7 +1991,7 @@ impl Window {
                     .spawn(async move {
                         handle
                             .update(&mut cx, |_, window, cx| window.appearance_changed(cx))
-                            .log_err();
+                            .warn_on_err();
                     })
                     .detach();
             }
@@ -2022,7 +2022,7 @@ impl Window {
 
                         SystemWindowTabController::update_last_active(cx, window.handle.id);
                     })
-                    .log_err();
+                    .warn_on_err();
             }
         }));
         platform_window.on_visibility_change(Box::new({
@@ -2043,7 +2043,7 @@ impl Window {
                         window.hovered.set(active);
                         window.refresh();
                     })
-                    .log_err();
+                    .warn_on_err();
             }
         }));
         platform_window.on_input({
@@ -2051,7 +2051,7 @@ impl Window {
             Box::new(move |event| {
                 handle
                     .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
-                    .log_err()
+                    .warn_on_err()
                     .unwrap_or(DispatchEventResult::default())
             })
         });
@@ -2067,7 +2067,7 @@ impl Window {
                         }
                         None
                     })
-                    .log_err()
+                    .warn_on_err()
                     .unwrap_or(None)
             })
         });
@@ -2078,7 +2078,7 @@ impl Window {
                     .update(&mut cx, |_, _window, cx| {
                         SystemWindowTabController::move_tab_to_new_window(cx, handle.window_id());
                     })
-                    .log_err();
+                    .warn_on_err();
             })
         });
         platform_window.on_merge_all_windows({
@@ -2088,7 +2088,7 @@ impl Window {
                     .update(&mut cx, |_, _window, cx| {
                         SystemWindowTabController::merge_all_windows(cx, handle.window_id());
                     })
-                    .log_err();
+                    .warn_on_err();
             })
         });
         platform_window.on_select_next_tab({
@@ -2098,7 +2098,7 @@ impl Window {
                     .update(&mut cx, |_, _window, cx| {
                         SystemWindowTabController::select_next_tab(cx, handle.window_id());
                     })
-                    .log_err();
+                    .warn_on_err();
             })
         });
         platform_window.on_select_previous_tab({
@@ -2108,7 +2108,7 @@ impl Window {
                     .update(&mut cx, |_, _window, cx| {
                         SystemWindowTabController::select_previous_tab(cx, handle.window_id())
                     })
-                    .log_err();
+                    .warn_on_err();
             })
         });
         platform_window.on_toggle_tab_bar({
@@ -2119,7 +2119,7 @@ impl Window {
                         let tab_bar_visible = window.platform_window.tab_bar_visible();
                         SystemWindowTabController::set_visible(cx, tab_bar_visible);
                     })
-                    .log_err();
+                    .warn_on_err();
             })
         });
 

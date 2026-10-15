@@ -1,6 +1,7 @@
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
+use super::offscreen_blit::X11Blitter;
 use crate::linux::X11ClientStatePtr;
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
@@ -272,6 +273,10 @@ pub struct X11WindowState {
     /// Taken when the window is dropped. Its GPU objects use the X connection, so they mustn't
     /// outlive the window, which a display mode switch relies on.
     renderer: Option<WgpuRenderer>,
+    /// Pushes `renderer`'s offscreen-rendered frames to the real X window via
+    /// XPutImage. Only present when `renderer.is_offscreen_x11()` (see
+    /// `ZED_FORCE_OFFSCREEN_X11` in `X11Window::new`).
+    offscreen_blitter: Option<X11Blitter>,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
     appearance: WindowAppearance,
@@ -756,7 +761,40 @@ impl X11WindowState {
 
             xcb_flush(xcb);
 
-            let mut renderer = {
+            // On hosts where creating or probing a native X11 surface crashes or produces
+            // no visible content (observed here: TigerVNC/Xvnc with no GLX/DRI3, where the
+            // NVIDIA Vulkan ICD segfaults inside `is_surface_supported()`), render into an
+            // offscreen texture and push frames to the window ourselves via XPutImage. See
+            // `offscreen_blit::X11Blitter` and `gpui_wgpu::WgpuRenderer::new_offscreen_x11`.
+            // Same fix already shipped for `warp-oss` on this host (`WARP_FORCE_OFFSCREEN_X11`).
+            let force_offscreen_x11 = std::env::var("ZED_FORCE_OFFSCREEN_X11").as_deref() == Ok("1");
+
+            // Note: this has to be done after the GPU init, or otherwise the sizes are
+            // immediately invalidated.
+            let render_size = query_render_extent(xcb, x_window)?;
+            let render_config = WgpuSurfaceConfig {
+                size: render_size,
+                // We set it to transparent by default, even if we have client-side
+                // decorations, since those seem to work on X11 even without `true` here.
+                // If the window appearance changes, then the renderer will get updated
+                // too
+                transparent: false,
+                preferred_present_mode: None,
+            };
+
+            let mut offscreen_blitter = None;
+            let mut renderer = if force_offscreen_x11 {
+                let renderer =
+                    WgpuRenderer::new_offscreen_x11(gpu_context, render_config, compositor_gpu)?;
+                offscreen_blitter = Some(X11Blitter::new(
+                    xcb,
+                    x_window,
+                    visual.depth,
+                    render_size.width.0 as u32,
+                    render_size.height.0 as u32,
+                )?);
+                renderer
+            } else {
                 let raw_window = RawWindow {
                     connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
                         xcb,
@@ -765,18 +803,7 @@ impl X11WindowState {
                     window_id: x_window,
                     visual_id: visual.id,
                 };
-                let config = WgpuSurfaceConfig {
-                    // Note: this has to be done after the GPU init, or otherwise
-                    // the sizes are immediately invalidated.
-                    size: query_render_extent(xcb, x_window)?,
-                    // We set it to transparent by default, even if we have client-side
-                    // decorations, since those seem to work on X11 even without `true` here.
-                    // If the window appearance changes, then the renderer will get updated
-                    // too
-                    transparent: false,
-                    preferred_present_mode: None,
-                };
-                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+                WgpuRenderer::new(gpu_context, &raw_window, render_config, compositor_gpu)?
             };
 
             renderer.set_subpixel_layout(is_bgr);
@@ -837,6 +864,7 @@ impl X11WindowState {
                 bounds: bounds.to_pixels(scale_factor),
                 scale_factor,
                 renderer: Some(renderer),
+                offscreen_blitter,
                 atoms: *atoms,
                 input_handler: None,
                 active: false,
@@ -1310,6 +1338,9 @@ impl X11WindowStatePtr {
             if let Some(renderer) = &mut state.renderer {
                 renderer.update_drawable_size(gpu_size);
             }
+            if let Some(blitter) = &mut state.offscreen_blitter {
+                blitter.resize(gpu_size.width.0 as u32, gpu_size.height.0 as u32);
+            }
             let result = (is_resize, state.content_size(), state.scale_factor);
             if let Some(value) = state.last_sync_counter.take() {
                 check_reply(
@@ -1776,6 +1807,14 @@ impl PlatformWindow for X11Window {
         }
 
         renderer.draw(scene);
+
+        if let Some((pixels, width, height)) = renderer.take_offscreen_frame() {
+            if let Some(blitter) = &inner.offscreen_blitter
+                && let Err(error) = blitter.blit_bgra(&pixels)
+            {
+                log::error!("Failed to blit offscreen X11 frame ({width}x{height}): {error:#}");
+            }
+        }
 
         if renderer.needs_redraw() {
             inner.force_render_after_recovery = true;

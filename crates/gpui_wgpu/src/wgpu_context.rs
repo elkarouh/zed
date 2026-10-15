@@ -316,6 +316,116 @@ impl WgpuContext {
         }
     }
 
+    /// Selects an adapter and creates a device without ever creating or
+    /// probing a native presentable surface. Used by the X11 offscreen-blit
+    /// fallback (`WgpuRenderer::new_offscreen_x11`): on hosts where probing
+    /// the real window surface panics or segfaults inside the GPU driver —
+    /// observed with the NVIDIA Vulkan ICD against a TigerVNC/Xvnc X server
+    /// lacking the GLX/DRI3 extensions needed for presentation — this path
+    /// never touches the window surface, so that crash can't happen here.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_for_offscreen(
+        compositor_gpu: Option<CompositorGpuHint>,
+    ) -> anyhow::Result<(Self, wgpu::TextureFormat)> {
+        let instance = Self::instance(None);
+        let device_id_filter = Self::device_id_filter();
+        let (adapter, device, queue, dual_source_blending, color_texture_format, target_format) =
+            gpui::block_on(async {
+                let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
+                if adapters.is_empty() {
+                    anyhow::bail!("No GPU adapters found");
+                }
+                Self::sort_adapters(&mut adapters, device_id_filter, compositor_gpu.as_ref());
+
+                log::info!(
+                    "Found {} GPU adapter(s) for offscreen X11 rendering:",
+                    adapters.len()
+                );
+                for adapter in &adapters {
+                    let info = adapter.get_info();
+                    log::info!(
+                        "  - {} (vendor={:#06x}, device={:#06x}, backend={:?}, type={:?})",
+                        info.name,
+                        info.vendor,
+                        info.device,
+                        info.backend,
+                        info.device_type,
+                    );
+                }
+
+                for adapter in adapters {
+                    let adapter_info = adapter.get_info();
+                    let Some(target_format) = Self::offscreen_target_format(&adapter) else {
+                        log::info!(
+                            "Adapter {:?} has no supported offscreen render target format",
+                            adapter_info.name
+                        );
+                        continue;
+                    };
+
+                    match Self::create_device(&adapter).await {
+                        Ok((device, queue, dual_source_blending, color_texture_format)) => {
+                            log::info!(
+                                "Selected GPU adapter for offscreen X11 rendering: {:?} ({:?})",
+                                adapter_info.name,
+                                adapter_info.backend,
+                            );
+                            return Ok((
+                                adapter,
+                                device,
+                                queue,
+                                dual_source_blending,
+                                color_texture_format,
+                                target_format,
+                            ));
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Failed to create offscreen device for adapter {:?}: {error:#}",
+                                adapter_info.name
+                            );
+                        }
+                    }
+                }
+
+                anyhow::bail!("No usable GPU adapter found for offscreen X11 rendering")
+            })?;
+
+        Ok((
+            Self::from_native_adapter_and_device(
+                instance,
+                adapter,
+                device,
+                queue,
+                dual_source_blending,
+                color_texture_format,
+            ),
+            target_format,
+        ))
+    }
+
+    /// Both candidates are 8-bit RGBA-ordered or BGRA-ordered formats: the
+    /// offscreen-blit readback copies rows as 4 bytes per pixel and only
+    /// ever uses `Bgra8Unorm` in practice (it matches the X11 ZPixmap byte
+    /// order on this host's little-endian depth-24/32 visuals), but
+    /// `Rgba8Unorm` is kept as a fallback for adapters that don't support it.
+    #[cfg(not(target_family = "wasm"))]
+    fn offscreen_target_format(adapter: &wgpu::Adapter) -> Option<wgpu::TextureFormat> {
+        let required_usages =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+        [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ]
+        .into_iter()
+        .find(|format| {
+            adapter
+                .get_texture_format_features(*format)
+                .allowed_usages
+                .contains(required_usages)
+        })
+    }
+
     #[cfg(not(target_family = "wasm"))]
     fn device_id_filter() -> Option<u32> {
         match std::env::var("ZED_DEVICE_ID") {
